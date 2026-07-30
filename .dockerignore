@@ -1,0 +1,12 @@
+.git
+.env
+.evn
+.env.txt
+data
+downloads
+__pycache__
+*.py[cod]
+*.db
+*.session
+*.session-journal
+*.log

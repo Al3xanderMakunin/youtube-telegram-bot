@@ -1,0 +1,21 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: youtube-telegram-bot
+    restart: unless-stopped
+    init: true
+    stdin_open: true
+    tty: true
+    env_file:
+      - .env
+    environment:
+      # Keep temporary media together with the other persistent bot state.
+      DOWNLOAD_DIR: /app/downloads
+    working_dir: /app
+    volumes:
+      # Database, Telegram sessions, bot.log, and downloaded media.
+      - ./data:/app/data
+      # Lets the interactive menu persist configuration changes on the host.
+      - ./.env:/app/data/.env
