@@ -166,6 +166,9 @@ class BotConfig:
         self.API_ID: int = int(os.getenv("API_ID", "0"))
         self.API_HASH: str = os.getenv("API_HASH", "")
         self.BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+        # Администратор задаётся при развёртывании. Это не позволяет первому
+        # случайному пользователю публичного бота забрать панель управления.
+        self.OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
         
         # Системные директории и кодеры
         self.DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", "./downloads")
@@ -196,8 +199,8 @@ class BotConfig:
             logger.error(f"Не удалось создать директорию скачивания {self.DOWNLOAD_DIR}: {e}")
 
     def _validate_keys(self) -> None:
-        if self.API_ID == 0 or not self.API_HASH or not self.BOT_TOKEN:
-            logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: Обязательные ключи (API_ID, API_HASH, BOT_TOKEN) отсутствуют в .env!")
+        if self.API_ID == 0 or not self.API_HASH or not self.BOT_TOKEN or self.OWNER_ID == 0:
+            logger.critical("❌ КРИТИЧЕСКАЯ ОШИБКА: API_ID, API_HASH, BOT_TOKEN или OWNER_ID отсутствуют в .env!")
             raise ConfigurationError("Заполните файл .env перед запуском приложения.")
 
     def update_key(self, key: str, value: Any) -> None:
@@ -802,19 +805,62 @@ class BotInterfaceUI:
 # РАЗДЕЛ 10: ГЛАВНЫЙ КОНТРОЛЛЕР ПРИЛОЖЕНИЯ (MONSTER BOT APP)
 # =====================================================================
 class MonsterBotApp:
-    def __init__(self, enable_userbot: bool):
+    def __init__(self):
         proxy = (socks.SOCKS5, config.PROXY_HOST, config.PROXY_PORT) if config.USE_PROXY else None
         
         self.bot = TelegramClient('bot_session', config.API_ID, config.API_HASH, proxy=proxy)
-        self.user = TelegramClient('user_session', config.API_ID, config.API_HASH, proxy=proxy) if enable_userbot else None
+        self.user: Optional[TelegramClient] = None
         
         self.bot_username: Optional[str] = None
-        self.owner_id: Optional[int] = None
+        self.owner_id: Optional[int] = config.OWNER_ID or None
         self.is_premium: bool = False
         self.video_cache: Dict[str, dict] = {}
+        self.premium_login_step: Optional[str] = None
+        self.premium_phone: Optional[str] = None
         
         YouTubeEngine.check_system()
         self._register_handlers()
+
+    def _admin_buttons(self) -> List[List[Button]]:
+        return [
+            [Button.inline("⚙️ Настройки", b"cfg:menu"), Button.inline("🔄 Обновить", b"cfg:refresh")],
+            [Button.inline("👥 Пользователи", b"cfg:users"), Button.inline("💎 Premium", b"cfg:premium")],
+        ]
+
+    def _admin_text(self) -> str:
+        stats = db.get_global_statistics()
+        return (
+            "👑 **ПАНЕЛЬ АДМИНИСТРАТОРА** 👑\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 **Пользователей в базе:** `{stats['total_users']}`\n"
+            f"🎬 **Скачано роликов:** `{stats['total_videos']}`\n"
+            f"💾 **Сгенерировано трафика:** `{stats['total_gb']:.2f} ГБ`\n"
+            f"⚡ **Файлов в кэше (CDN):** `{stats['cached_files']}`\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚙️ **Видеокодек:** `{config.VIDEO_ENCODER}`\n"
+            f"📦 **Пачка плейлиста:** `по {config.DEFAULT_BATCH_SIZE} видео`\n"
+            f"🌐 **Прокси:** `{'Включён' if config.USE_PROXY else 'Выключен'}`\n"
+            f"🛡️ **Premium:** `{'Активен (4 ГБ)' if self.is_premium else 'Выключен (2 ГБ)'}`\n\n"
+            "Команды: `/users`, `/ban <ID>`, `/unban <ID>`, `/broadcast <текст>`"
+        )
+
+    async def _activate_saved_userbot(self) -> bool:
+        """Подключает уже авторизованную Premium-сессию без консольных запросов."""
+        if self.user is None:
+            proxy = (socks.SOCKS5, config.PROXY_HOST, config.PROXY_PORT) if config.USE_PROXY else None
+            self.user = TelegramClient('user_session', config.API_ID, config.API_HASH, proxy=proxy)
+        await self.user.connect()
+        if not await self.user.is_user_authorized():
+            return False
+        user_me = await self.user.get_me()
+        if self.owner_id and self.owner_id != user_me.id:
+            logger.warning("OWNER_ID не совпадает с ID Premium-аккаунта; Premium-отправка отключена.")
+            return False
+        self.owner_id = user_me.id
+        self.is_premium = bool(getattr(user_me, 'premium', False))
+        config.PREMIUM_USERS.add(user_me.id)
+        logger.info(f"Premium-юзербот подключён: {user_me.id}; Premium={self.is_premium}")
+        return True
 
     def _register_handlers(self):
         
@@ -832,6 +878,43 @@ class MonsterBotApp:
                 f"🛡️ *Ваш личный лимит загрузки: {'4 ГБ (Premium)' if self.is_premium else '2 ГБ (Standard)'}*"
             )
 
+        # Ввод номера, кода и пароля 2FA для Premium-аккаунта. Обрабатывается
+        # только от OWNER_ID и только во время явной настройки через /admin.
+        @self.bot.on(events.NewMessage())
+        async def premium_login_handler(event):
+            if not self.owner_id or event.sender_id != self.owner_id or not self.premium_login_step:
+                return
+            value = (event.raw_text or "").strip()
+            if not value or value.startswith('/'):
+                return
+            try:
+                if self.premium_login_step == 'phone':
+                    self.premium_phone = value
+                    if self.user is None:
+                        proxy = (socks.SOCKS5, config.PROXY_HOST, config.PROXY_PORT) if config.USE_PROXY else None
+                        self.user = TelegramClient('user_session', config.API_ID, config.API_HASH, proxy=proxy)
+                    await self.user.connect()
+                    await self.user.send_code_request(self.premium_phone)
+                    self.premium_login_step = 'code'
+                    await event.respond("📨 Код отправлен Telegram. Пришлите его сюда одним сообщением.")
+                elif self.premium_login_step == 'code':
+                    try:
+                        await self.user.sign_in(phone=self.premium_phone, code=value)
+                    except SessionPasswordNeededError:
+                        self.premium_login_step = 'password'
+                        return await event.respond("🔐 Включена двухфакторная защита. Пришлите пароль 2FA.")
+                    self.premium_login_step = None
+                    await self._activate_saved_userbot()
+                    await event.respond("✅ Premium-аккаунт подключён. Лимит и отправка будут применены сразу.")
+                elif self.premium_login_step == 'password':
+                    await self.user.sign_in(password=value)
+                    self.premium_login_step = None
+                    await self._activate_saved_userbot()
+                    await event.respond("✅ Premium-аккаунт подключён. Лимит и отправка будут применены сразу.")
+            except Exception as e:
+                logger.error(f"Ошибка авторизации Premium-аккаунта: {e}")
+                await event.respond(f"❌ Не удалось выполнить авторизацию: `{str(e)[:160]}`")
+
         # --- ADMIN HANDLERS ---
         @self.bot.on(events.NewMessage(pattern=r'^/(admin|users|ban|unban|broadcast)'))
         async def admin_handler(event):
@@ -841,25 +924,7 @@ class MonsterBotApp:
             text = event.text.strip()
             
             if text == '/admin':
-                stats = db.get_global_statistics()
-                msg = (
-                    "👑 **ПАНЕЛЬ АДМИНИСТРАТОРА** 👑\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"👥 **Пользователей в базе:** `{stats['total_users']}`\n"
-                    f"🎬 **Скачано роликов:** `{stats['total_videos']}`\n"
-                    f"💾 **Сгенерировано трафика:** `{stats['total_gb']:.2f} ГБ`\n"
-                    f"⚡ **Файлов в кэше (CDN):** `{stats['cached_files']}`\n"
-                    "━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚙️ **Активный видеокодек:** `{config.VIDEO_ENCODER}`\n"
-                    f"📦 **Размер пачки плейлиста:** `по {config.DEFAULT_BATCH_SIZE} видео`\n"
-                    f"🛡️ **Статус Premium:** `{'Активен (Лимит 4 ГБ)' if self.is_premium else 'Выключен (Лимит 2 ГБ)'}`\n\n"
-                    "**Команды управления:**\n"
-                    "`/users` — Список всех пользователей и их ID\n"
-                    "`/ban <ID>` — Заблокировать юзера\n"
-                    "`/unban <ID>` — Разблокировать юзера\n"
-                    "`/broadcast <Текст>` — Рассылка всем юзерам"
-                )
-                await event.respond(msg)
+                await event.respond(self._admin_text(), buttons=self._admin_buttons())
                 
             elif text == '/users':
                 db.cursor.execute('SELECT user_id, username, is_banned FROM users ORDER BY joined_at DESC LIMIT 50')
@@ -905,6 +970,78 @@ class MonsterBotApp:
                     except Exception: pass
                     
                 await progress_msg.edit(f"✅ **Рассылка завершена!**\nУспешно доставлено: `{success_count} / {len(users)}`")
+
+        # --- ADMIN CALLBACKS: ВСЕ НАСТРОЙКИ ИЗ TELEGRAM ---
+        @self.bot.on(events.CallbackQuery(pattern=b'^cfg:'))
+        async def settings_callback(event):
+            if not self.owner_id or event.sender_id != self.owner_id:
+                return await event.answer("Недостаточно прав доступа.", alert=True)
+
+            action = event.data.decode('utf-8')
+            if action in ('cfg:refresh', 'cfg:back'):
+                await event.edit(self._admin_text(), buttons=self._admin_buttons())
+                return await event.answer()
+
+            if action == 'cfg:menu':
+                buttons = [
+                    [Button.inline("libx264 (CPU)", b"cfg:codec:libx264")],
+                    [Button.inline("h264_nvenc (NVIDIA)", b"cfg:codec:h264_nvenc")],
+                    [Button.inline("h264_amf (AMD)", b"cfg:codec:h264_amf")],
+                    [Button.inline("h264_qsv (Intel)", b"cfg:codec:h264_qsv")],
+                    [Button.inline(f"🌐 Прокси: {'ВКЛ' if config.USE_PROXY else 'ВЫКЛ'}", b"cfg:proxy")],
+                    [Button.inline("📦 Пачка: 1", b"cfg:batch:1"), Button.inline("3", b"cfg:batch:3"), Button.inline("5", b"cfg:batch:5"), Button.inline("10", b"cfg:batch:10")],
+                    [Button.inline("🗑️ Сбросить Premium-сессию", b"cfg:premium_reset")],
+                    [Button.inline("← К панели", b"cfg:back")],
+                ]
+                await event.edit("⚙️ **Настройки бота**\n\nИзменения кодека и пачки применяются сразу. Изменение прокси требует перезапуска контейнера.", buttons=buttons)
+                return await event.answer()
+
+            if action.startswith('cfg:codec:'):
+                codec = action.rsplit(':', 1)[1]
+                if codec not in {'libx264', 'h264_nvenc', 'h264_amf', 'h264_qsv'}:
+                    return await event.answer("Неизвестный кодек.", alert=True)
+                config.update_key('VIDEO_ENCODER', codec)
+                return await event.answer(f"Кодек изменён: {codec}", alert=True)
+
+            if action.startswith('cfg:batch:'):
+                batch_size = action.rsplit(':', 1)[1]
+                if batch_size not in {'1', '3', '5', '10'}:
+                    return await event.answer("Недопустимый размер пачки.", alert=True)
+                config.update_key('DEFAULT_BATCH_SIZE', batch_size)
+                return await event.answer(f"Размер пачки: {batch_size}", alert=True)
+
+            if action == 'cfg:proxy':
+                config.USE_PROXY = not config.USE_PROXY
+                config.update_key('USE_PROXY', str(config.USE_PROXY))
+                return await event.answer("Настройка сохранена. Перезапустите контейнер, чтобы переподключить Telegram через новый прокси.", alert=True)
+
+            if action == 'cfg:premium':
+                if self.user and await self.user.is_user_authorized():
+                    return await event.answer("Premium-аккаунт уже подключён.", alert=True)
+                self.premium_login_step = 'phone'
+                self.premium_phone = None
+                return await event.respond("💎 **Подключение Premium-аккаунта**\n\nПришлите номер телефона в международном формате, например `+79991234567`.\n\nОтправляйте номер, код и пароль 2FA только в личном чате с ботом.")
+
+            if action == 'cfg:premium_reset':
+                self.premium_login_step = None
+                self.premium_phone = None
+                if self.user:
+                    await self.user.disconnect()
+                    self.user = None
+                for filename in ('user_session.session', 'user_session.session-journal'):
+                    if os.path.exists(filename):
+                        os.remove(filename)
+                self.is_premium = False
+                return await event.answer("Premium-сессия удалена.", alert=True)
+
+            if action == 'cfg:users':
+                db.cursor.execute('SELECT user_id, username, is_banned FROM users ORDER BY joined_at DESC LIMIT 50')
+                users = db.cursor.fetchall()
+                text = "📭 Список пользователей пуст." if not users else "👥 **Последние 50 пользователей:**\n\n" + "\n".join(
+                    f"`{uid}` | @{uname or 'без_юзернейма'} | {'⛔️ БАН' if banned else '✅'}" for uid, uname, banned in users
+                )
+                await event.edit(text, buttons=[[Button.inline("← К панели", b"cfg:back")]])
+                return await event.answer()
 
         # --- HANDLING YOUTUBE & PLAYLIST LINKS ---
         @self.bot.on(events.NewMessage())
@@ -1280,27 +1417,18 @@ class MonsterBotApp:
         await self.bot.start(bot_token=config.BOT_TOKEN)
         bot_me = await self.bot.get_me()
         self.bot_username = bot_me.username
-        
-        if self.user:
-            logger.info("🔑 Инициализация Premium-юзербота...")
-            await self.user.start()
-            user_me = await self.user.get_me()
-            self.owner_id = user_me.id
-            self.is_premium = getattr(user_me, 'premium', False)
-            
-            if self.owner_id not in config.PREMIUM_USERS:
-                config.PREMIUM_USERS.add(self.owner_id)
-            
+
+        if await self._activate_saved_userbot():
             logger.info("🚀 СИСТЕМА ДВОЙНОГО КОНТУРА АКТИВИРОВАНА!")
-            logger.info(f"👑 Владелец: {user_me.first_name} | Premium: {'АКТИВЕН' if self.is_premium else 'ОТСУТСТВУЕТ'}")
-            
             await asyncio.gather(self.bot.disconnected, self.user.disconnected)
-        else:
-            self.is_premium = False
-            self.owner_id = None
-            logger.info("🚀 БОТ УСПЕШНО ЗАПУЩЕН В СТАНДАРТНОМ РЕЖИМЕ (Лимит 2 ГБ)!")
-            
-            await self.bot.run_until_disconnected()
+            return
+
+        if self.user:
+            await self.user.disconnect()
+            self.user = None
+        self.is_premium = False
+        logger.info("🚀 БОТ УСПЕШНО ЗАПУЩЕН В СТАНДАРТНОМ РЕЖИМЕ (лимит 2 ГБ). Premium настраивается через /admin.")
+        await self.bot.run_until_disconnected()
 
 
 # =====================================================================
@@ -1403,11 +1531,8 @@ def interactive_cli_menu() -> bool:
 # =====================================================================
 if __name__ == "__main__":
     print_banner()
-    
-    enable_userbot = interactive_cli_menu()
-    
     try:
-        app = MonsterBotApp(enable_userbot)
+        app = MonsterBotApp()
         asyncio.run(app.start())
     except KeyboardInterrupt:
         print("\n👋 Бот успешно остановлен пользователем. Всего доброго!")

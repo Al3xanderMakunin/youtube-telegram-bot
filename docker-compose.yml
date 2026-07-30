@@ -6,8 +6,6 @@ services:
     container_name: youtube-telegram-bot
     restart: unless-stopped
     init: true
-    stdin_open: true
-    tty: true
     env_file:
       - .env
     environment:
