@@ -169,6 +169,9 @@ class BotConfig:
         # Администратор задаётся при развёртывании. Это не позволяет первому
         # случайному пользователю публичного бота забрать панель управления.
         self.OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
+        # Канал, куда дублируются готовые MP3, заказанные владельцем бота.
+        # Значение 0 означает, что отправка в канал выключена.
+        self.AUDIO_CHANNEL_ID: int = int(os.getenv("AUDIO_CHANNEL_ID", "0"))
         
         # Системные директории и кодеры
         self.DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", "./downloads")
@@ -817,6 +820,7 @@ class MonsterBotApp:
         self.video_cache: Dict[str, dict] = {}
         self.premium_login_step: Optional[str] = None
         self.premium_phone: Optional[str] = None
+        self.audio_channel_input: bool = False
         
         YouTubeEngine.check_system()
         self._register_handlers()
@@ -841,8 +845,30 @@ class MonsterBotApp:
             f"📦 **Пачка плейлиста:** `по {config.DEFAULT_BATCH_SIZE} видео`\n"
             f"🌐 **Прокси:** `{'Включён' if config.USE_PROXY else 'Выключен'}`\n"
             f"🛡️ **Premium:** `{'Активен (4 ГБ)' if self.is_premium else 'Выключен (2 ГБ)'}`\n\n"
+            f"🎵 **Канал аудио:** `{config.AUDIO_CHANNEL_ID or 'не задан'}`\n\n"
             "Команды: `/users`, `/ban <ID>`, `/unban <ID>`, `/broadcast <текст>`"
         )
+
+    async def _send_owner_audio_to_channel(
+        self, sender: TelegramClient, file: Any, caption: str,
+        attributes: Optional[List[Any]] = None, thumb: Optional[str] = None
+    ) -> bool:
+        """Дублирует аудио владельца в заданный канал.
+
+        Ошибка канала не должна ломать основную доставку файла администратору.
+        """
+        if not config.AUDIO_CHANNEL_ID:
+            return False
+        try:
+            await sender.send_file(
+                config.AUDIO_CHANNEL_ID, file, caption=caption, thumb=thumb,
+                attributes=attributes or [], supports_streaming=True
+            )
+            logger.info(f"🎵 Аудио администратора отправлено в канал {config.AUDIO_CHANNEL_ID}.")
+            return True
+        except Exception as e:
+            logger.error(f"Не удалось отправить аудио в канал {config.AUDIO_CHANNEL_ID}: {e}")
+            return False
 
     async def _activate_saved_userbot(self) -> bool:
         """Подключает уже авторизованную Premium-сессию без консольных запросов."""
@@ -914,6 +940,32 @@ class MonsterBotApp:
             except Exception as e:
                 logger.error(f"Ошибка авторизации Premium-аккаунта: {e}")
                 await event.respond(f"❌ Не удалось выполнить авторизацию: `{str(e)[:160]}`")
+
+        # Ввод ID канала после нажатия кнопки в /admin.
+        @self.bot.on(events.NewMessage())
+        async def audio_channel_input_handler(event):
+            if not self.owner_id or event.sender_id != self.owner_id or not self.audio_channel_input:
+                return
+            value = (event.raw_text or "").strip()
+            if not value or value.startswith('/'):
+                return
+            try:
+                channel_id = int(value)
+                if channel_id >= 0:
+                    raise ValueError
+            except ValueError:
+                return await event.respond("❌ Пришлите числовой ID канала, например `-1001234567890`.")
+
+            self.audio_channel_input = False
+            config.update_key('AUDIO_CHANNEL_ID', channel_id)
+            try:
+                await self.bot.get_entity(channel_id)
+            except Exception:
+                return await event.respond(
+                    f"⚠️ ID `{channel_id}` сохранён, но бот пока не видит канал. "
+                    "Добавьте бота в канал администратором с правом публикации."
+                )
+            await event.respond(f"✅ Канал для аудио сохранён: `{channel_id}`.")
 
         # --- ADMIN HANDLERS ---
         @self.bot.on(events.NewMessage(pattern=r'^/(admin|users|ban|unban|broadcast)'))
@@ -989,6 +1041,8 @@ class MonsterBotApp:
                     [Button.inline("h264_amf (AMD)", b"cfg:codec:h264_amf")],
                     [Button.inline("h264_qsv (Intel)", b"cfg:codec:h264_qsv")],
                     [Button.inline(f"🌐 Прокси: {'ВКЛ' if config.USE_PROXY else 'ВЫКЛ'}", b"cfg:proxy")],
+                    [Button.inline("🎵 Задать ID аудио-канала", b"cfg:audio_channel")],
+                    [Button.inline("🚫 Отключить аудио-канал", b"cfg:audio_channel_off")],
                     [Button.inline("📦 Пачка: 1", b"cfg:batch:1"), Button.inline("3", b"cfg:batch:3"), Button.inline("5", b"cfg:batch:5"), Button.inline("10", b"cfg:batch:10")],
                     [Button.inline("🗑️ Сбросить Premium-сессию", b"cfg:premium_reset")],
                     [Button.inline("← К панели", b"cfg:back")],
@@ -1014,6 +1068,19 @@ class MonsterBotApp:
                 config.USE_PROXY = not config.USE_PROXY
                 config.update_key('USE_PROXY', str(config.USE_PROXY))
                 return await event.answer("Настройка сохранена. Перезапустите контейнер, чтобы переподключить Telegram через новый прокси.", alert=True)
+
+            if action == 'cfg:audio_channel':
+                self.audio_channel_input = True
+                return await event.respond(
+                    "🎵 **Канал готовых аудио**\n\n"
+                    "Пришлите числовой ID канала, например `-1001234567890`.\n"
+                    "Бот должен быть администратором канала с правом публикации."
+                )
+
+            if action == 'cfg:audio_channel_off':
+                self.audio_channel_input = False
+                config.update_key('AUDIO_CHANNEL_ID', 0)
+                return await event.answer("Отправка аудио в канал отключена.", alert=True)
 
             if action == 'cfg:premium':
                 if self.user and await self.user.is_user_authorized():
@@ -1188,6 +1255,11 @@ class MonsterBotApp:
                     caption = f"🎬 **{cache['title']}**\n\n👤 Автор: {Utils.make_hashtag(cache['uploader'])}"
                     
                     await self.bot.send_file(user_id, cached_file_id, caption=caption)
+                    if format_choice == 'mp3' and user_id == self.owner_id:
+                        await self._send_owner_audio_to_channel(
+                            self.bot, cached_file_id, caption,
+                            [DocumentAttributeAudio(duration=cache['duration'], title=cache['title'])]
+                        )
                     await msg.delete()
                     db.update_stats(user_id, 0)
                     return
@@ -1256,6 +1328,13 @@ class MonsterBotApp:
                     sent_msg = await sender.send_file(target, uploaded_file, caption=caption, thumb=thumb_file, attributes=attributes, supports_streaming=True)
                 else:
                     sent_msg = await sender.send_file(user_id, uploaded_file, caption=caption, thumb=thumb_file, attributes=attributes, supports_streaming=True)
+
+                # В канал публикуются только MP3, заказанные самим
+                # администратором. Аудио остальных пользователей не затрагиваются.
+                if format_choice == 'mp3' and user_id == self.owner_id:
+                    await self._send_owner_audio_to_channel(
+                        sender, uploaded_file, caption, attributes, thumb_file
+                    )
 
                 # 🔥 СОХРАНЕНИЕ В КЭШ ДЛЯ ОДИНОЧНЫХ ВИДЕО (до 2 ГБ)
                 if sender == self.bot and sent_msg and sent_msg.document:
