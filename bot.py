@@ -786,6 +786,8 @@ def get_format_tier(w: int, h: int, note: str = "") -> int:
     long_side = max(w, h)
     short_side = min(w, h)
 
+    if long_side >= 3800 or short_side >= 2100:
+        return 2160
     if long_side >= 2400 or short_side >= 1350:
         return 1440
     if long_side >= 1650 or short_side >= 850:
@@ -816,11 +818,11 @@ def get_available_tiers(info: dict) -> List[int]:
     if top_t > 0:
         tiers.add(top_t)
 
-    standard_tiers = [1080, 720, 480, 360]
+    standard_tiers = [2160, 1440, 1080, 720, 480, 360]
     result: Set[int] = set()
     max_t = max(tiers) if tiers else 720
     for st in standard_tiers:
-        if st <= max_t or st in tiers:
+        if st in tiers or (st <= 1080 and st <= max_t):
             result.add(st)
 
     if not result:
@@ -829,7 +831,7 @@ def get_available_tiers(info: dict) -> List[int]:
     return sorted(result, reverse=True)
 
 def estimate_size_mb(duration: int, tier: int) -> int:
-    bitrates = {1080: 3500, 720: 1800, 480: 900, 360: 500}
+    bitrates = {2160: 25000, 1440: 12000, 1080: 3500, 720: 1800, 480: 900, 360: 500}
     br = bitrates.get(tier, 1500)
     dur = max(duration, 1)
     mb = int((br * dur) / (8 * 1024))
@@ -1261,7 +1263,7 @@ def download_video(url: str, quality: str, user_id: int, video_id: str, lang: st
     opts["merge_output_format"] = "mp4"
 
     q = int(quality) if str(quality).isdigit() else 720
-    max_w_map = {1080: 1920, 720: 1280, 480: 854, 360: 640}
+    max_w_map = {2160: 3840, 1440: 2560, 1080: 1920, 720: 1280, 480: 854, 360: 640}
     max_w = max_w_map.get(q, 1280)
 
     if lang == "ru":
@@ -1491,6 +1493,10 @@ def make_video_keyboard(vid: str, current_lang: str = "orig", is_playlist: bool 
                 Button.inline(f"{en_mark}🇬🇧 Оригинал", f"pllang:en:{vid}".encode())
             ])
 
+        buttons.append([
+            Button.inline("⚡ 2160p", f"pl:{DEFAULT_BATCH}:2160:{vid}:{current_lang}".encode()),
+            Button.inline("⚡ 1440p", f"pl:{DEFAULT_BATCH}:1440:{vid}:{current_lang}".encode())
+        ])
         buttons.append([
             Button.inline("⚡ 1080p", f"pl:{DEFAULT_BATCH}:1080:{vid}:{current_lang}".encode()),
             Button.inline("⚡ 720p", f"pl:{DEFAULT_BATCH}:720:{vid}:{current_lang}".encode())
