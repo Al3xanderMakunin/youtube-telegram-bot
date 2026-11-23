@@ -802,6 +802,31 @@ def get_format_tier(w: int, h: int, note: str = "") -> int:
         return 240
     return 144
 
+DIRECT_COPY_VIDEO_CODECS = ("h264", "avc1")
+
+
+def can_copy_video(codec: str) -> bool:
+    return codec.lower().split(".", 1)[0] in DIRECT_COPY_VIDEO_CODECS
+
+
+def get_video_transcode_tiers(info: dict) -> Set[int]:
+    video_tiers = set()
+    copy_tiers = set()
+    for fmt in info.get("formats", []) or []:
+        codec = fmt.get("vcodec")
+        if not codec or codec == "none":
+            continue
+        tier = get_format_tier(fmt.get("width"), fmt.get("height"), fmt.get("format_note"))
+        if tier:
+            video_tiers.add(tier)
+            if can_copy_video(codec):
+                copy_tiers.add(tier)
+    return video_tiers - copy_tiers
+
+
+VIDEO_TRANSCODE_NOTICE = "🐢 **Перекодирование видео может занять много времени.**"
+
+
 def get_available_tiers(info: dict) -> List[int]:
     tiers: Set[int] = set()
     for f in info.get("formats", []) or []:
@@ -1076,10 +1101,11 @@ def run_ffmpeg(cmd: List[str], output: str, cancel_token=None) -> Tuple[bool, st
         return False, err
     return True, ""
 
-def process_video_direct(src: str, dst: str, cancel_token=None) -> Tuple[bool, str]:
-    info = probe(src)
+def process_video_direct(src: str, dst: str, cancel_token=None, *, info=None) -> Tuple[bool, str]:
+    if info is None:
+        info = probe(src)
     audio_codec = "copy" if info["acodec"] in ("aac", "mp3") else "aac"
-    video_codec = "copy" if info["vcodec"] in ("h264", "avc1") else VIDEO_ENCODER
+    video_codec = "copy" if can_copy_video(info["vcodec"]) else VIDEO_ENCODER
 
     def convert(encoder):
         cmd = [
@@ -1092,6 +1118,13 @@ def process_video_direct(src: str, dst: str, cancel_token=None) -> Tuple[bool, s
     if not success and video_codec not in ("copy", "libx264") and not (cancel_token and cancel_token.cancelled):
         return convert("libx264")
     return success, detail
+
+
+async def process_video_with_status(src: str, dst: str, token, msg, buttons):
+    info = await asyncio.to_thread(probe, src)
+    if not can_copy_video(info["vcodec"]):
+        await msg.edit(VIDEO_TRANSCODE_NOTICE, buttons=buttons)
+    return await asyncio.to_thread(process_video_direct, src, dst, token, info=info)
 
 # ─────────────────────────────────────────────
 # YT-DLP ЗАГРУЗЧИК
@@ -1527,7 +1560,8 @@ def make_video_keyboard(vid: str, current_lang: str = "orig", is_playlist: bool 
     row = []
     for t in tiers:
         has_cached = bool(db.get_cache(vid, str(t), lang=current_lang))
-        icon = "⚡" if has_cached else "🎬"
+        needs_transcode = current_lang != "ya" and t in meta.get("transcode_tiers", ())
+        icon = "⚡" if has_cached else "🐢" if needs_transcode else "🎬"
         est_mb = estimate_size_mb(duration, t)
         row.append(Button.inline(f"{icon} {t}p (~{est_mb} МБ)", f"dl:{t}:{vid}:{current_lang}".encode()))
         if len(row) == 2:
@@ -2471,6 +2505,7 @@ def setup_handlers(client: TelegramClient):
                 "url": url, "title": orig_title, "translated_title": ru_title,
                 "uploader": uploader, "duration": duration, "is_short": is_short,
                 "max_quality": max_tier, "tiers": tiers,
+                "transcode_tiers": get_video_transcode_tiers(info),
                 "audio_info": audio_info,
                 "selected_lang": selected_lang
             }
@@ -2546,9 +2581,16 @@ def setup_handlers(client: TelegramClient):
             lang_label = "Оригинальный звук"
 
         q_label = "MP3 🎵" if quality == "mp3" else f"{quality}p 🎬"
-        msg = await event.reply(f"⏳ **Подготовка...**\nКачество: `{q_label}` | Звук: `{lang_label}`", buttons=cancel_kb)
-
         cache_data = db.get_cache(vid, quality, lang=lang)
+        needs_transcode = (
+            quality.isdigit()
+            and lang != "ya"
+            and int(quality) in meta.get("transcode_tiers", ())
+        )
+        preparation_text = f"⏳ **Подготовка...**\nКачество: `{q_label}` | Звук: `{lang_label}`"
+        warning = f"\n\n{VIDEO_TRANSCODE_NOTICE}" if needs_transcode and not cache_data else ""
+        msg = await event.reply(preparation_text + warning, buttons=cancel_kb)
+
         if cache_data:
             cached_file_id, cached_title = cache_data
             term_log("⚡ CACHE HIT", f"[{uid}] Видео {vid} [{quality}p_{lang.upper()}] отдано из кэша!", Colors.GREEN)
@@ -2597,10 +2639,10 @@ def setup_handlers(client: TelegramClient):
                             raise RuntimeError("Ошибка сведения звука Яндекса")
                     else:
                         term_log("⚠️ YANDEX AI", "Не удалось получить озвучку Яндекса, отправляю оригинал", Colors.YELLOW)
-                        await asyncio.to_thread(process_video_direct, raw_src, final, token)
+                        await process_video_with_status(raw_src, final, token, msg, cancel_kb)
                         await rm(raw_src)
                 else:
-                    await asyncio.to_thread(process_video_direct, raw_src, final, token)
+                    await process_video_with_status(raw_src, final, token, msg, cancel_kb)
                     await rm(raw_src)
 
             size_mb = os.path.getsize(final) / (1024 * 1024)
@@ -2827,7 +2869,7 @@ def setup_handlers(client: TelegramClient):
                 thumb_key = f"{vid}_{lang}" if lang in ("ru", "en") else str(vid)
                 thumb = make_thumb(uid, thumb_key)
                 final = os.path.join(DOWNLOAD_DIR, f"{uid}_{vid}_{lang}_fast.mp4")
-                await asyncio.to_thread(process_video_direct, raw_src, final, token)
+                await process_video_with_status(raw_src, final, token, status, cancel_kb)
                 await rm(raw_src)
                 info_p = probe(final)
                 attrs = [DocumentAttributeVideo(
