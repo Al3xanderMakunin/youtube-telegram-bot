@@ -1,0 +1,1015 @@
+"""
+channel_monitor.py — автономный бот-агент с умным определением
+игр (Куплинов, скобки, теги, Винди), жанров и защитой от старых видео.
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+import yt_dlp
+from telethon import TelegramClient, events, Button
+from telethon.tl.types import DocumentAttributeVideo
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import bot as core
+
+# ─────────────────────────────────────────────
+# НАСТРОЙКИ
+# ─────────────────────────────────────────────
+MONITOR_BOT_TOKEN = os.getenv("MONITOR_BOT_TOKEN", "")
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@blogeridownload")
+POLL_INTERVAL_MINUTES = float(os.getenv("MONITOR_POLL_INTERVAL_MINUTES", "15"))
+VIDEOS_PER_CHANNEL_CHECK = int(os.getenv("MONITOR_VIDEOS_PER_CHECK", "15"))
+MONITOR_VIDEO_QUALITY = os.getenv("MONITOR_VIDEO_QUALITY", "720")
+
+# Жёсткий фильтр: видео старше этого количества часов НЕ публикуются как новые!
+MONITOR_MAX_AGE_HOURS = float(os.getenv("MONITOR_MAX_AGE_HOURS", "48"))
+
+MONITOR_BOOTSTRAP_LOOKBACK_HOURS = float(os.getenv("MONITOR_BOOTSTRAP_LOOKBACK_HOURS", "24"))
+MONITOR_BOOTSTRAP_FRESH_CHECK = int(os.getenv("MONITOR_BOOTSTRAP_FRESH_CHECK", "3"))
+
+LEGACY_CHANNELS_FILE = os.getenv("MONITOR_CHANNELS_FILE", "channels.json")
+
+# Обычный Bot API (MONITOR_BOT_TOKEN) не может отправлять файлы больше 2 ГБ —
+# это ограничение Telegram, не наше. Чтобы публиковать ролики больше, нужен
+# второй контур — личный аккаунт (юзербот), как и в основном bot.py, но
+# отдельная сессия: channel_monitor.py — отдельный процесс, и одновременно
+# открывать тот же user_session.session, что и bot.py, нельзя (SQLite-сессия
+# не любит два процесса сразу — файл может повредиться).
+_monitor_userbot_env = os.getenv("MONITOR_USE_USERBOT", "")
+MONITOR_USE_USERBOT = (_monitor_userbot_env.lower() == "true") if _monitor_userbot_env else core.USE_USERBOT
+MONITOR_USER_SESSION = os.getenv("MONITOR_USER_SESSION", "monitor_user_session")
+BOT_API_FILE_LIMIT_MB = 1990  # чуть меньше жёсткого лимита Telegram в 2048 МБ, с запасом
+
+# Сколько раз подряд пробовать опубликовать один и тот же ролик, прежде чем
+# сдаться и пометить его как "обработанный" (чтобы не долбиться в одну и ту
+# же стену бесконечно, если ролик опубликован вручную или падает по другой
+# неустранимой причине).
+MAX_RETRY_ATTEMPTS = int(os.getenv("MONITOR_MAX_RETRY", "2"))
+
+if not MONITOR_BOT_TOKEN:
+    core.term_log("⛔ CRITICAL", "MONITOR_BOT_TOKEN не задан в .env", core.Colors.RED)
+    sys.exit(1)
+
+pending: dict = {}
+check_lock = asyncio.Lock()
+videos_in_progress: set = set()
+user_client: Optional[TelegramClient] = None  # подключается в main(), если MONITOR_USE_USERBOT
+
+# ─────────────────────────────────────────────
+# СЧЁТЧИК НЕУДАЧНЫХ ПОПЫТОК (чтобы не долбить один и тот же ролик вечно)
+# ─────────────────────────────────────────────
+def _init_failure_table():
+    core.db.c.execute("""
+        CREATE TABLE IF NOT EXISTS monitor_failures (
+            video_id TEXT PRIMARY KEY,
+            attempts INTEGER DEFAULT 0,
+            last_error TEXT,
+            last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    core.db.conn.commit()
+
+def get_failure_count(video_id: str) -> int:
+    core.db.c.execute("SELECT attempts FROM monitor_failures WHERE video_id=?", (video_id,))
+    row = core.db.c.fetchone()
+    return row[0] if row else 0
+
+def record_failure(video_id: str, error) -> int:
+    core.db.c.execute(
+        "INSERT INTO monitor_failures (video_id, attempts, last_error, last_attempt) VALUES (?,1,?,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(video_id) DO UPDATE SET attempts=attempts+1, last_error=excluded.last_error, last_attempt=CURRENT_TIMESTAMP",
+        (video_id, str(error)[:500])
+    )
+    core.db.conn.commit()
+    return get_failure_count(video_id)
+
+def clear_failure(video_id: str):
+    core.db.c.execute("DELETE FROM monitor_failures WHERE video_id=?", (video_id,))
+    core.db.conn.commit()
+
+# ─────────────────────────────────────────────
+# БАЗА ИГР И ЖАНРОВ
+# ─────────────────────────────────────────────
+POPULAR_GAMES = [
+    (r'\b(minecraft|майнкрафт|майн)\b', '#Minecraft'),
+    (r'\b(roblox|роблокс)\b', '#Roblox'),
+    (r'\b(gta\s*5|гта\s*5|гта\s*v|gta\s*v|гта|gta)\b', '#GTA5'),
+    (r'\b(brawl\s*stars|бравл\s*старс|бравл)\b', '#BrawlStars'),
+    (r'\b(standoff\s*2|стандофф\s*2|стандофф|стандик)\b', '#Standoff2'),
+    (r'\b(counter[- ]*strike\s*2|cs\s*2|кс\s*2|csgo|cs:go|ксго)\b', '#CS2'),
+    (r'\b(dota\s*2|дота\s*2|дота|дотка)\b', '#Dota2'),
+    (r'\b(genshin\s*impact|геншин\s*импакт|геншин)\b', '#GenshinImpact'),
+    (r'\b(honkai[:\s]*star\s*rail|хонкай)\b', '#HonkaiStarRail'),
+    (r'\b(fnaf|фнаф|five\s*nights\s*at\s*freddy)\b', '#FNAF'),
+    (r'\b(pubg|пабг|пубг)\b', '#PUBG'),
+    (r'\b(fortnite|фортнайт)\b', '#Fortnite'),
+    (r'\b(rust|раст)\b', '#Rust'),
+    (r'\b(lethal\s*company|летал\s*компани)\b', '#LethalCompany'),
+    (r'\b(phasmophobia|фазмофобия|фазма)\b', '#Phasmophobia'),
+    (r'\b(poppy\s*playtime|поппи\s*плейтайм)\b', '#PoppyPlaytime'),
+    (r'\b(among\s*us|амонг\s*ас|амонгас)\b', '#AmongUs'),
+    (r'\b(geometry\s*dash|геометрия\s*даш|гд)\b', '#GeometryDash'),
+    (r'\b(terraria|террария)\b', '#Terraria'),
+    (r'\b(the\s*sims|симс)\b', '#TheSims'),
+    (r'\b(valorant|валорант)\b', '#Valorant'),
+    (r'\b(apex\s*legends|апекс)\b', '#ApexLegends'),
+    (r'\b(world\s*of\s*tanks|мир\s*танков|танки|wot)\b', '#МирТанков'),
+    (r'\b(tanks\s*blitz|blitz|блиц)\b', '#TanksBlitz'),
+    (r'\b(elden\s*ring|элден\s*ринг)\b', '#EldenRing'),
+    (r'\b(cyberpunk|киберпанк)\b', '#Cyberpunk2077'),
+    (r'\b(witcher|ведьмак)\b', '#Ведьмак3'),
+    (r'\b(stalker|сталкер)\b', '#Сталкер'),
+    (r'\b(subnautica|сабнатика)\b', '#Subnautica'),
+    (r'\b(fall\s*guys|фол\s*гайз)\b', '#FallGuys'),
+    (r'\b(cuphead|капхед)\b', '#Cuphead'),
+    (r'\b(undertale|андертейл)\b', '#Undertale'),
+    (r'\b(detroit[:\s]*become\s*human|детройт)\b', '#Detroit'),
+    (r'\b(clash\s*royale|клеш\s*рояль|клеш)\b', '#ClashRoyale'),
+    (r'\b(sims\s*4|симс\s*4)\b', '#Sims4'),
+    (r'\b(euro\s*truck|етс\s*2|ets\s*2)\b', '#ETS2'),
+    (r'\b(beamng|бимка)\b', '#BeamNG'),
+    (r'\b(garry\'?s\s*mod|гаррис\s*мод|гмод|gmod)\b', '#GarrysMod'),
+    (r'\b(dead\s*by\s*daylight|дбд|dbd)\b', '#DBD'),
+    (r'\b(atomic\s*heart|атомик\s*харт)\b', '#AtomicHeart'),
+    (r'\b(assassin\'?s\s*creed|ассасин)\b', '#AssassinsCreed'),
+    # Хорроры (специфика Винди / Куплинова)
+    (r'\b(the\s*walten\s*files|волтен\s*файлс|файлы\s*волтена)\b', '#TheWaltenFiles'),
+    (r'\b(mandela\s*catalogue|каталог\s*манделы)\b', '#MandelaCatalogue'),
+    (r'\b(bendy\s*and\s*the\s*ink\s*machine|бенди)\b', '#Bendy'),
+    (r'\b(hello\s*neighbor|привет\s*сосед)\b', '#HelloNeighbor'),
+    (r'\b(baldi\'?s\s*basics|балди)\b', '#BaldisBasics'),
+    (r'\b(granny|бабка\s*гренни|гренни)\b', '#Granny'),
+    (r'\bdoors\b(?!\s*(?:closed|open|way))', '#DOORS'),
+    (r'\b(silent\s*hill|сайлент\s*хилл)\b', '#SilentHill'),
+    (r'\b(resident\s*evil|резидент\s*ивл|биохазард)\b', '#ResidentEvil'),
+    (r'\b(outlast|аутласт)\b', '#Outlast'),
+    (r'\b(amnesia|амнезия)\b', '#Amnesia'),
+    (r'\bscp\b', '#SCP'),
+    (r'\b(backrooms|бэкрумс|закулисье)\b', '#Backrooms'),
+    (r'\b(little\s*nightmares|литл\s*найтмэрс)\b', '#LittleNightmares'),
+    (r'\b(content\s*warning)\b', '#ContentWarning'),
+    (r'\b(choo[- ]*choo\s*charles|чух[- ]*чух\s*чарльз)\b', '#ChooChooCharles'),
+    (r'\b(buckshot\s*roulette)\b', '#BuckshotRoulette'),
+    (r'\b(inscryption)\b', '#Inscryption'),
+    (r'\b(piggy)\b', '#Piggy'),
+    (r'\b(schedule\s*1|schedule\s*i)\b', '#ScheduleI'),
+    (r'\b(dayz|дэй\s*зэт)\b', '#DayZ'),
+    (r'\b(analog\s*horror|аналоговый\s*хоррор)\b', '#АналоговыйХоррор'),
+    (r'\b(fears\s*to\s*fathom)\b', '#FearsToFathom'),
+]
+
+# Слова-исключения внутри скобок, которые точно НЕ являются названием игры
+IGNORE_IN_PARENTHESES = {
+    '18+', 'финал', 'конец', 'часть', 'серия', 'сезон', 'обзор', 'стрим',
+    'нарезка', 'shorts', 'reupload', '4k', '60fps', 'hd', 'full hd',
+    'шок', 'жесть', 'эксперимент', 'voice', 'дубляж', 'реакция', 'react'
+}
+
+def format_clean_hashtag(text: str) -> str:
+    """Форматирует красивый CamelCase хештег без спецсимволов"""
+    clean = re.sub(r'[^\w\s]', '', text or '').strip()
+    words = clean.split()
+    if not words:
+        return ""
+    tag = "".join(w.capitalize() for w in words)
+    return "#" + tag
+
+def extract_game_from_title_patterns(title: str) -> Optional[str]:
+    """
+    Вытаскивает игру из заголовка:
+    1. После стрелки Куплинова: "НАЗВАНИЕ ► [ТЕГ] Игра #1"
+    2. Из скобок блогеров: "Спасаем пса ( Like a dog )"
+    """
+    # 1. Шаблон Куплинова: после стрелочки ► или ▶
+    m_arrow = re.search(r'[►▶]\s*(?:\[[^\]]+\]\s*)?([A-Za-zА-Яа-я0-9\s:\'\-–]+)', title)
+    if m_arrow:
+        candidate = m_arrow.group(1).strip()
+        # Отрезаем номер серии/части: "#1", "Часть 2", "Финал", "- Эпизод"
+        cleaned = re.sub(r'(\s*#\d+|\s+часть\s*\d*|\s+финал|\s+серия\s*\d*|\s+конец).*$', '', candidate, flags=re.IGNORECASE).strip()
+        if len(cleaned) >= 2 and not cleaned.isdigit():
+            # Если это игра из нашего списка — отдаем каноничный тег
+            for pattern, gtag in POPULAR_GAMES:
+                if re.search(pattern, cleaned, re.IGNORECASE):
+                    return gtag
+            return format_clean_hashtag(cleaned)
+
+    # 2. Шаблон скобок: ( Game Name ) или [ Game Name ]
+    for match in re.finditer(r'[\(\[]\s*([A-Za-z0-9\s:\'\-\?!\.]{2,35})\s*[\)\]]', title):
+        cand = match.group(1).strip()
+        cand_lower = cand.lower()
+        if any(ign in cand_lower for ign in IGNORE_IN_PARENTHESES):
+            continue
+        cleaned = re.sub(r'[\?!]+$', '', cand).strip()
+        if len(cleaned) >= 2 and not cleaned.isdigit():
+            for pattern, gtag in POPULAR_GAMES:
+                if re.search(pattern, cleaned, re.IGNORECASE):
+                    return gtag
+            return format_clean_hashtag(cleaned)
+
+    return None
+
+def detect_video_tags(meta: dict, title: str) -> list:
+    """
+    Определяет жанр (обзор, теория, хоррор) и название игры.
+    Работает для Куплинова, Винди, Дюшеса и любых геймеров.
+    """
+    desc = (meta.get("description") or "").strip()
+    text = f"{title} {desc}".lower()
+    categories = [c.lower() for c in (meta.get("categories") or [])]
+    tags = [str(t).lower() for t in (meta.get("tags") or [])]
+
+    found_tags = []
+
+    # 1. Проверка на реальную жизнь (IRL)
+    is_irl = bool(re.search(r'\b(в реальной жизни|в реале|в реальности|на самом деле|вживую|irl|live action)\b', text))
+
+    # 2. Формат ролика
+    if re.search(r'\b(обзор|мнение|распаковка|тест|review|разбор игры|первый взгляд|стоит ли)\b', title, re.IGNORECASE):
+        found_tags.append("🔍 #Обзор")
+    elif re.search(r'\b(теория|теории|сюжет|лор|вся правда|секреты|пасхалки|айсберг|история создания|концовка|объяснение)\b', title, re.IGNORECASE):
+        found_tags.append("🧠 #Теории")
+    elif re.search(r'\b(реакция|смотрит|реагирует|реакция на|react)\b', title, re.IGNORECASE):
+        found_tags.append("👀 #Реакция")
+    elif re.search(r'\b(челлендж|24 часа|100 дней|кто последний|эксперимент|challenge|я выжил|я провел|попробуй не)\b', title, re.IGNORECASE):
+        found_tags.append("🏆 #Челлендж")
+    elif is_irl:
+        found_tags.append("⛺ #ВРеале")
+
+    # Хорроры (Куплинов, Винди)
+    if re.search(r'\b(инди хоррор|страшная игра|horror|herror|жуткая игра|хоррор игра|пугалка)\b', title, re.IGNORECASE):
+        if "🔍 #Обзор" not in found_tags:
+            found_tags.append("👻 #Хоррор")
+
+    # 3. Определение названия игры
+    game_tag = None
+
+    # Шаг А: Поиск по шаблонам Куплинова (►) и скобкам ( Like a dog )
+    game_from_pattern = extract_game_from_title_patterns(title)
+    if game_from_pattern:
+        game_tag = game_from_pattern
+
+    # Шаг Б: Поиск по базе популярных игр (для Винди и общих названий)
+    if not game_tag:
+        for pattern, gtag in POPULAR_GAMES:
+            if re.search(pattern, title, re.IGNORECASE):
+                game_tag = gtag
+                break
+
+    # Шаг В: Официальное поле YouTube Gaming (если заполнено)
+    if not game_tag:
+        raw_game = meta.get("game")
+        if raw_game and isinstance(raw_game, str) and len(raw_game.strip()) > 1:
+            for pattern, gtag in POPULAR_GAMES:
+                if re.search(pattern, raw_game, re.IGNORECASE):
+                    game_tag = gtag
+                    break
+            if not game_tag:
+                game_tag = format_clean_hashtag(raw_game)
+
+    # Шаг Г: Поиск строки "Игра: Название" в описании
+    if not game_tag:
+        m_game = re.search(r'(?:игра|game)[:\s]+([^\n\r,]+)', desc, re.IGNORECASE)
+        if m_game:
+            found_name = m_game.group(1).strip()
+            for pattern, gtag in POPULAR_GAMES:
+                if re.search(pattern, found_name, re.IGNORECASE):
+                    game_tag = gtag
+                    break
+            if not game_tag and len(found_name) < 25:
+                game_tag = format_clean_hashtag(found_name)
+
+    # Шаг Д: Поиск по тегам ролика
+    if not game_tag:
+        for t in tags:
+            for pattern, gtag in POPULAR_GAMES:
+                if re.search(pattern, t, re.IGNORECASE):
+                    game_tag = gtag
+                    break
+            if game_tag:
+                break
+
+    if game_tag:
+        found_tags.append(f"🎮 {game_tag}")
+
+    return found_tags
+
+def get_video_age_hours(meta: dict) -> Optional[float]:
+    """Определяет возраст ролика в часах по timestamp или дате upload_date"""
+    # 1. Точный unix timestamp
+    ts = meta.get("timestamp") or meta.get("release_timestamp")
+    if ts:
+        try:
+            return (time.time() - float(ts)) / 3600.0
+        except Exception:
+            pass
+
+    # 2. Строковая дата "YYYYMMDD"
+    ud = meta.get("upload_date")
+    if ud and len(ud) == 8 and ud.isdigit():
+        try:
+            dt = datetime.strptime(ud, "%Y%m%d")
+            return (time.time() - dt.timestamp()) / 3600.0
+        except Exception:
+            pass
+
+    return None
+
+# ─────────────────────────────────────────────
+# УТИЛИТЫ КАНАЛОВ
+# ─────────────────────────────────────────────
+def slugify(text: str) -> str:
+    key = re.sub(r"\s+", "_", (text or "").strip().lower())
+    key = re.sub(r"[^\w]", "", key, flags=re.UNICODE)
+    if not key:
+        key = f"ch{int(time.time())}"
+    base = key
+    n = 2
+    while core.db.monitor_get_channel(key):
+        key = f"{base}_{n}"
+        n += 1
+    return key
+
+def normalize_channel_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("@"):
+        raw = f"https://www.youtube.com/{raw}"
+    if "youtube.com" not in raw and "youtu.be" not in raw:
+        return ""
+    if not raw.startswith("http"):
+        raw = "https://" + raw
+    if "/videos" not in raw:
+        raw = raw.rstrip("/") + "/videos"
+    return raw
+
+def migrate_legacy_channels_json():
+    if not os.path.exists(LEGACY_CHANNELS_FILE):
+        return
+    try:
+        with open(LEGACY_CHANNELS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        core.term_log("⚠️ MONITOR", f"Не удалось прочитать {LEGACY_CHANNELS_FILE}: {e}", core.Colors.YELLOW)
+        return
+
+    imported = 0
+    for entry in data:
+        key = entry.get("key") or slugify(entry.get("name", ""))
+        existing = core.db.monitor_get_channel(key)
+        if existing and existing.get("url"):
+            continue
+        name = entry.get("name") or key
+        url = entry.get("url", "")
+        tag = core.hashtag(name)
+        core.db.monitor_add_channel(key, name, url, tag)
+        if entry.get("bootstrapped"):
+            core.db.monitor_set_bootstrapped(key)
+        imported += 1
+
+    if imported:
+        core.term_log("📦 MONITOR", f"Докатил {imported} канал(ов) из {LEGACY_CHANNELS_FILE} в базу", core.Colors.CYAN)
+
+    try:
+        done_path = LEGACY_CHANNELS_FILE + ".imported"
+        if os.path.exists(done_path):
+            os.remove(done_path)
+        os.rename(LEGACY_CHANNELS_FILE, done_path)
+        core.term_log("📦 MONITOR", f"{LEGACY_CHANNELS_FILE} переименован в {done_path}", core.Colors.CYAN)
+    except Exception as e:
+        core.term_log("⚠️ MONITOR", f"Не удалось переименовать {LEGACY_CHANNELS_FILE}: {e}", core.Colors.YELLOW)
+
+# ─────────────────────────────────────────────
+# ПОЛУЧЕНИЕ СПИСКА ВИДЕО
+# ─────────────────────────────────────────────
+def fetch_latest_videos(channel_url: str, limit: int) -> list:
+    opts = core.ytdlp_opts()
+    opts["extract_flat"] = True
+    opts["playlistend"] = limit
+    opts["skip_download"] = True
+    ea = dict(opts.get("extractor_args") or {})
+    ea["youtubetab"] = ea.get("youtubetab", []) + ["skip=authcheck"]
+    opts["extractor_args"] = ea
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(channel_url, download=False)
+    except Exception as e:
+        core.term_log("⚠️ MONITOR", f"Не удалось получить список видео {channel_url}: {e}", core.Colors.YELLOW)
+        return []
+
+    entries = info.get("entries") or []
+    videos = []
+    for e in entries:
+        if not e:
+            continue
+        vid = e.get("id")
+        if not vid:
+            continue
+        videos.append({
+            "id": vid,
+            "title": e.get("title") or f"Видео {vid}",
+            "url": e.get("url") or f"https://www.youtube.com/watch?v={vid}",
+        })
+    return videos
+
+# ─────────────────────────────────────────────
+# СКАЧИВАНИЕ + ПУБЛИКАЦИЯ
+# ─────────────────────────────────────────────
+async def post_video(client: TelegramClient, channel: dict, video: dict):
+    vid = video["id"]
+    url = video["url"]
+    title = video["title"]
+    name = channel["name"]
+
+    # Хештег автора всегда начинается с #
+    author_tag = channel.get("hashtag") or core.hashtag(name)
+    if not author_tag.startswith("#"):
+        author_tag = "#" + author_tag.lstrip("#")
+
+    raw_target = channel.get("target_channel") or TARGET_CHANNEL
+    targets = [t.strip() for t in raw_target.split(",") if t.strip()]
+    if not targets:
+        targets = [TARGET_CHANNEL]
+
+    if vid in videos_in_progress:
+        core.term_log("⏭️ MONITOR", f"[{name}] {vid} уже качается — пропуск дубля", core.Colors.YELLOW)
+        return
+
+    fail_count = get_failure_count(vid)
+    if fail_count >= MAX_RETRY_ATTEMPTS:
+        core.term_log(
+            "🏳️ MONITOR",
+            f"[{name}] «{title}» ({vid}) уже падал {fail_count} раз подряд — сдаюсь, "
+            f"считаю обработанным (вручную или навсегда недоступно)",
+            core.Colors.YELLOW
+        )
+        core.db.monitor_mark_posted(vid, name, title)
+        clear_failure(vid)
+        try:
+            await client.send_message(
+                core.OWNER_ID,
+                f"⚠️ Не смог автоматически опубликовать «{title}» ({vid}) из канала «{name}» "
+                f"после {fail_count} попыток подряд. Пометил как обработанное, больше качать не буду. "
+                f"Если видео ещё нет на канале — выложи вручную.\n\n"
+                f"Причина последней ошибки: см. лог."
+            )
+        except Exception:
+            pass
+        return
+
+    videos_in_progress.add(vid)
+
+    try:
+        # Извлекаем метаданные для проверки даты и игры
+        meta = {}
+        try:
+            opts_meta = core.ytdlp_opts()
+            opts_meta["skip_download"] = True
+            with yt_dlp.YoutubeDL(opts_meta) as ydl:
+                meta = await asyncio.to_thread(ydl.extract_info, url, download=False) or {}
+        except Exception:
+            pass
+
+        # ── ЖЁСТКИЙ ФИЛЬТР ВОЗРАСТА: отсекаем старые ролики (7 месяцев и т.д.) ──
+        age_hours = get_video_age_hours(meta)
+        if age_hours is not None and age_hours > MONITOR_MAX_AGE_HOURS:
+            days = age_hours / 24.0
+            core.term_log(
+                "⏭️ MONITOR",
+                f"[{name}] Пропуск старого видео ({days:.0f} дн. назад > {MONITOR_MAX_AGE_HOURS:.0f}ч): {title} ({vid})",
+                core.Colors.YELLOW
+            )
+            # Запоминаем в базе, чтобы больше никогда не пытаться его проверять
+            core.db.monitor_mark_posted(vid, name, title)
+            return
+
+        core.term_log("⬇️ MONITOR", f"[{name}] Новое видео: {title} ({vid}) → {', '.join(targets)}", core.Colors.CYAN)
+
+        # Анализ тегов (игра, обзор, хоррор, теория)
+        tags_list = detect_video_tags(meta, title)
+        if tags_list:
+            core.term_log("🏷️ TAGS", f"[{name}] Найдено: {' '.join(tags_list)}", core.Colors.GREEN)
+
+        path = await asyncio.to_thread(core.download_video, url, MONITOR_VIDEO_QUALITY, 0, vid, "orig", None)
+        thumb = core.make_thumb(0, str(vid))
+        info = core.probe(path)
+
+        if not info["width"]:
+            raise ValueError("скачанный файл не содержит видеодорожку (возможен блок/18+)")
+
+        duration = info["duration"]
+        w = info["width"]
+        h = info["height"]
+
+        # Формируем пост:
+        # 🎬 **Название ролика**
+        #
+        # 🎮 #Игра 👻 #Хоррор (если есть)
+        # 👤 #Автор
+        # 🔗 youtu.be/ID — обычным текстом, не кнопкой (кнопка ломает "Комментарии"
+        # у канала), но по этой ссылке бот умеет узнавать уже выложенные видео
+        # при сканировании истории канала — см. sync_posted_from_channel().
+        caption_lines = [f"🎬 **{title}**\n"]
+        if tags_list:
+            caption_lines.append(" ".join(tags_list))
+        caption_lines.append(f"👤 {author_tag}")
+        caption_lines.append(f"🔗 youtu.be/{vid}")
+
+        caption = "\n".join(caption_lines)
+
+        # Обычный бот-токен не может отправить файл больше ~2 ГБ — это лимит
+        # Telegram Bot API. Если файл больше и юзербот подключен — шлём через
+        # него (личный аккаунт должен быть добавлен в целевой(ые) канал(ы)).
+        file_size_mb = os.path.getsize(path) / (1024 * 1024)
+        send_client = client
+        if file_size_mb > BOT_API_FILE_LIMIT_MB:
+            if user_client:
+                send_client = user_client
+                core.term_log(
+                    "💎 MONITOR",
+                    f"[{name}] Файл {file_size_mb:.0f} МБ > лимита Bot API ({BOT_API_FILE_LIMIT_MB} МБ) — отправляю через юзербота",
+                    core.Colors.CYAN
+                )
+            else:
+                raise ValueError(
+                    f"файл {file_size_mb:.0f} МБ превышает лимит обычного Bot API ({BOT_API_FILE_LIMIT_MB} МБ), "
+                    f"а юзербот не подключен — включи MONITOR_USE_USERBOT=true в .env и перезапусти"
+                )
+
+        for target in targets:
+            await send_client.send_file(
+                target,
+                path,
+                caption=caption,
+                thumb=thumb,
+                attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
+            )
+
+        core.db.monitor_mark_posted(vid, name, title)
+        clear_failure(vid)
+        core.term_log("✅ MONITOR", f"[{name}] Опубликовано: {title}", core.Colors.GREEN)
+
+    except Exception as e:
+        attempts = record_failure(vid, e)
+        core.term_log(
+            "❌ MONITOR",
+            f"[{name}] Ошибка публикации {vid} (попытка {attempts}/{MAX_RETRY_ATTEMPTS}): {e}",
+            core.Colors.RED
+        )
+    finally:
+        videos_in_progress.discard(vid)
+        for fname in os.listdir(core.DOWNLOAD_DIR):
+            if str(vid) in fname:
+                try:
+                    os.remove(os.path.join(core.DOWNLOAD_DIR, fname))
+                except Exception:
+                    pass
+
+# ─────────────────────────────────────────────
+# СКАНИРОВАНИЕ КАНАЛА (чтобы не дублировать видео, выложенные вручную)
+# ─────────────────────────────────────────────
+YT_ID_IN_TEXT_RE = re.compile(
+    r'(?:youtu\.be/|youtube\.com/(?:watch\?v=|shorts/|embed/))([A-Za-z0-9_-]{11})'
+)
+
+def extract_video_ids_from_text(text: str) -> list:
+    if not text:
+        return []
+    return YT_ID_IN_TEXT_RE.findall(text)
+
+async def sync_posted_from_channel(channel_identifier: str, limit: int = 500) -> int:
+    """Проходит по истории Telegram-канала и помечает в базе как 'уже
+    опубликовано' все video_id, которые находит в подписях (через ссылку
+    youtu.be/ID) — не важно, бот их туда положил или ты сам руками. Так
+    при следующей проверке бот не станет перекачивать то, что уже на канале.
+
+    ВАЖНО: читать историю канала (GetHistoryRequest) умеет только обычный
+    пользовательский аккаунт — Telegram жёстко запрещает это для bot-токенов,
+    это не обходится настройками. Поэтому здесь используется юзербот
+    (user_client), а не обычный бот (MONITOR_BOT_TOKEN)."""
+    if not user_client:
+        return -1  # сигнал "не сканировали вообще", отличаем от "нашли 0"
+    found = 0
+    try:
+        async for msg in user_client.iter_messages(channel_identifier, limit=limit):
+            text = msg.text or msg.message or ""
+            for vid in extract_video_ids_from_text(text):
+                if not core.db.monitor_is_posted(vid):
+                    core.db.monitor_mark_posted(vid, "synced_from_channel", "")
+                    found += 1
+    except Exception as e:
+        core.term_log("⚠️ MONITOR", f"Не удалось просканировать канал {channel_identifier}: {e}", core.Colors.YELLOW)
+    return found
+
+async def sync_all_target_channels(limit: int = 500):
+    """Собирает все реально используемые Telegram-каналы (из всех настроенных
+    YouTube-каналов плюс канал по умолчанию) и сканирует каждый по одному разу.
+    Требует подключённого юзербота (MONITOR_USE_USERBOT=true) — без него
+    сканирование истории канала невозможно в принципе (ограничение Telegram)."""
+    if not user_client:
+        core.term_log(
+            "⚠️ MONITOR",
+            "Сканирование истории канала требует юзербота (MONITOR_USE_USERBOT=true в .env) — "
+            "боты не умеют читать историю канала, это ограничение самого Telegram. Пропускаю.",
+            core.Colors.YELLOW
+        )
+        return 0
+
+    targets = {TARGET_CHANNEL}
+    for ch in core.db.monitor_list_channels():
+        raw = ch.get("target_channel") or ""
+        for t in raw.split(","):
+            t = t.strip()
+            if t:
+                targets.add(t)
+
+    total = 0
+    for t in targets:
+        n = await sync_posted_from_channel(t, limit=limit)
+        if n > 0:
+            core.term_log("🔄 MONITOR", f"Канал {t}: найдено и учтено {n} уже выложенных видео", core.Colors.CYAN)
+        total += max(n, 0)
+    return total
+
+# ─────────────────────────────────────────────
+# ПРОВЕРКА КАНАЛОВ
+# ─────────────────────────────────────────────
+async def check_channel(client: TelegramClient, channel: dict):
+    key = channel["key"]
+    name = channel["name"]
+    url = channel["url"]
+
+    videos = await asyncio.to_thread(fetch_latest_videos, url, VIDEOS_PER_CHANNEL_CHECK)
+    if not videos:
+        return
+
+    # Первый запуск для канала: запоминаем существующие ролики,
+    # публикуем только самые свежие (< MONITOR_BOOTSTRAP_LOOKBACK_HOURS)
+    if not channel.get("bootstrapped"):
+        fresh_to_post = []
+        for i, v in enumerate(videos):
+            is_fresh = False
+            if i < MONITOR_BOOTSTRAP_FRESH_CHECK:
+                # Получаем метаданные ролика
+                meta = {}
+                try:
+                    opts_meta = core.ytdlp_opts()
+                    opts_meta["skip_download"] = True
+                    with yt_dlp.YoutubeDL(opts_meta) as ydl:
+                        meta = await asyncio.to_thread(ydl.extract_info, v["url"], download=False) or {}
+                except Exception:
+                    pass
+                age_h = get_video_age_hours(meta)
+                if age_h is not None and age_h <= MONITOR_BOOTSTRAP_LOOKBACK_HOURS:
+                    is_fresh = True
+
+            if is_fresh:
+                fresh_to_post.append(v)
+            else:
+                core.db.monitor_mark_posted(v["id"], name, v["title"])
+
+        core.db.monitor_set_bootstrapped(key)
+        core.term_log(
+            "📌 MONITOR",
+            f"[{name}] Первый запуск — запомнено {len(videos)} видео, свежих к публикации: {len(fresh_to_post)}",
+            core.Colors.CYAN
+        )
+        for v in reversed(fresh_to_post):
+            await post_video(client, channel, v)
+            await asyncio.sleep(3)
+        return
+
+    # Обычная проверка: отбираем ролики, которых нет в базе
+    new_videos = [v for v in videos if not core.db.monitor_is_posted(v["id"])]
+    for v in reversed(new_videos):
+        await post_video(client, channel, v)
+        await asyncio.sleep(3)
+
+async def run_all_channels(client: TelegramClient):
+    async with check_lock:
+        for channel in core.db.monitor_list_channels():
+            try:
+                await check_channel(client, channel)
+            except Exception as e:
+                core.term_log("❌ MONITOR", f"Ошибка проверки канала {channel.get('name')}: {e}", core.Colors.RED)
+
+async def poll_loop(client: TelegramClient):
+    while True:
+        await run_all_channels(client)
+        await asyncio.sleep(POLL_INTERVAL_MINUTES * 60)
+
+# ─────────────────────────────────────────────
+# УПРАВЛЕНИЕ ИЗ TELEGRAM
+# ─────────────────────────────────────────────
+def is_owner(event) -> bool:
+    return event.sender_id == core.OWNER_ID
+
+def main_menu_buttons():
+    return [
+        [Button.inline("➕ Добавить канал", b"menu:add"), Button.inline("📺 Список каналов", b"menu:list")],
+        [Button.inline("🔍 Проверить всё сейчас", b"menu:checkall")],
+    ]
+
+def channel_list_buttons(channels: list):
+    rows = []
+    for ch in channels:
+        rows.append([
+            Button.inline(f"📺 {ch['name']}", f"ch:info:{ch['key']}".encode()),
+            Button.inline("🗑", f"ch:del:{ch['key']}".encode()),
+        ])
+    rows.append([Button.inline("➕ Добавить канал", b"menu:add"), Button.inline("🔙 Меню", b"menu:back")])
+    return rows
+
+def register_handlers(client: TelegramClient):
+    @client.on(events.NewMessage(pattern=r"^/(start|menu)(\s|$)"))
+    async def cmd_menu(event):
+        if not is_owner(event):
+            return
+        pending.pop(event.sender_id, None)
+        n = len(core.db.monitor_list_channels())
+        await event.respond(
+            f"🤖 **Монитор-бот**\nОтслеживается каналов: {n}\nПубликует в: {TARGET_CHANNEL}\nКачество: {MONITOR_VIDEO_QUALITY}p",
+            buttons=main_menu_buttons()
+        )
+
+    @client.on(events.NewMessage(pattern=r"^/channels(\s|$)"))
+    async def cmd_channels(event):
+        if not is_owner(event):
+            return
+        channels = core.db.monitor_list_channels()
+        if not channels:
+            await event.respond("Каналов пока нет.", buttons=[[Button.inline("➕ Добавить канал", b"menu:add")]])
+            return
+        await event.respond("📺 **Каналы:**", buttons=channel_list_buttons(channels))
+
+    @client.on(events.NewMessage(pattern=r"^/addchannel(\s|$)"))
+    async def cmd_addchannel(event):
+        if not is_owner(event):
+            return
+        pending[event.sender_id] = {"action": "add", "step": "url", "data": {}}
+        await event.respond("Пришли ссылку на YouTube-канал (например https://www.youtube.com/@handle):")
+
+    @client.on(events.NewMessage(pattern=r"^/check(@\w+)?(\s|$)"))
+    async def cmd_check(event):
+        if not is_owner(event):
+            return
+        args = event.raw_text.split(maxsplit=1)
+        target_key = args[1].strip().lower() if len(args) > 1 else None
+
+        if check_lock.locked():
+            await event.respond("⏳ Проверка уже идёт — дождись завершения.")
+            return
+
+        if target_key:
+            channel = core.db.monitor_get_channel(target_key)
+            if not channel:
+                await event.respond(f"⚠️ Канал с key=`{target_key}` не найден. Смотри /channels")
+                return
+            await event.respond(f"🔍 Проверяю только «{channel['name']}»...")
+            async with check_lock:
+                await check_channel(client, channel)
+            await event.respond("✅ Готово.")
+        else:
+            n = len(core.db.monitor_list_channels())
+            await event.respond(f"🔍 Внеочередная проверка всех {n} каналов...")
+            await run_all_channels(client)
+            await event.respond("✅ Проверка завершена.")
+
+    @client.on(events.NewMessage(pattern=r"^/forget(\s|$)"))
+    async def cmd_forget(event):
+        if not is_owner(event):
+            return
+        args = event.raw_text.split(maxsplit=1)
+        if len(args) < 2:
+            await event.respond("Использование: `/forget VIDEO_ID` (например `ux9UjdJuiVY`).")
+            return
+        vid = args[1].strip()
+        ok = core.db.monitor_forget(vid)
+        await event.respond(f"✅ Забыл `{vid}`, теперь он снова новый." if ok else f"⚠️ `{vid}` не найден.")
+
+    @client.on(events.NewMessage(pattern=r"^/sync(\s|$)"))
+    async def cmd_sync(event):
+        if not is_owner(event):
+            return
+        await event.respond("🔄 Сканирую каналы на уже выложенные видео (в т.ч. то, что ты запостил вручную)...")
+        n = await sync_all_target_channels()
+        await event.respond(f"✅ Готово. Учтено видео: {n}." if n else "✅ Готово. Новых уже выложенных видео не найдено.")
+
+    @client.on(events.NewMessage())
+    async def on_any_message(event):
+        if not is_owner(event):
+            return
+        text = event.raw_text.strip()
+        if text.startswith("/"):
+            return
+        state = pending.get(event.sender_id)
+        if not state:
+            return
+
+        if state["action"] == "add":
+            data = state["data"]
+            if state["step"] == "url":
+                url = normalize_channel_url(text)
+                if not url:
+                    await event.respond("⚠️ Это не похоже на ссылку YouTube. Пришли ещё раз, например https://www.youtube.com/@handle")
+                    return
+                data["url"] = url
+                state["step"] = "name"
+                await event.respond("Как называть канал в подписи к видео? (например: Дюшес)")
+            elif state["step"] == "name":
+                data["name"] = text
+                data["suggested_tag"] = core.hashtag(text)
+                state["step"] = "hashtag"
+                await event.respond(f"Хештег автора? Отправь свой (например `#Дюшес`) или `-`, чтобы оставить `{data['suggested_tag']}`:")
+            elif state["step"] == "hashtag":
+                tag = text if text != "-" else data["suggested_tag"]
+                if not tag.startswith("#"):
+                    tag = "#" + tag.lstrip("#")
+                data["hashtag"] = tag
+                state["step"] = "target"
+                await event.respond(
+                    f"В какой Telegram-канал публиковать? Пришли @username (или -100id), "
+                    f"можно несколько через запятую, или `-` для канала по умолчанию (`{TARGET_CHANNEL}`):"
+                )
+            elif state["step"] == "target":
+                target = None if text == "-" else text
+                key = slugify(data["name"])
+                core.db.monitor_add_channel(key, data["name"], data["url"], data["hashtag"], target)
+                pending.pop(event.sender_id, None)
+                await event.respond(
+                    f"✅ Добавил канал **{data['name']}** (`{key}`)\nХештег: {data['hashtag']}\nURL: {data['url']}\n"
+                    f"Публикует в: {target or TARGET_CHANNEL + ' (по умолчанию)'}\n\n"
+                    f"При следующей проверке бот начнёт следить за новыми роликами.",
+                    buttons=main_menu_buttons()
+                )
+
+        elif state["action"] == "edit_hashtag":
+            key = state["data"]["key"]
+            tag = text
+            if not tag.startswith("#"):
+                tag = "#" + tag.lstrip("#")
+            core.db.monitor_set_hashtag(key, tag)
+            pending.pop(event.sender_id, None)
+            await event.respond(f"✅ Хештег для `{key}` теперь: {tag}", buttons=main_menu_buttons())
+
+        elif state["action"] == "edit_target":
+            key = state["data"]["key"]
+            target = None if text == "-" else text
+            core.db.monitor_set_target(key, target)
+            pending.pop(event.sender_id, None)
+            await event.respond(
+                f"✅ Канал публикации для `{key}` теперь: {target or TARGET_CHANNEL + ' (по умолчанию)'}",
+                buttons=main_menu_buttons()
+            )
+
+    @client.on(events.CallbackQuery())
+    async def on_callback(event):
+        if event.sender_id != core.OWNER_ID:
+            await event.answer("Не для тебя 🙂", alert=True)
+            return
+        data = event.data.decode()
+
+        if data == "menu:back":
+            await event.edit("🤖 **Монитор-бот** — выбери действие:", buttons=main_menu_buttons())
+
+        elif data == "menu:add":
+            pending[event.sender_id] = {"action": "add", "step": "url", "data": {}}
+            await event.respond("Пришли ссылку на YouTube-канал (например https://www.youtube.com/@handle):")
+            await event.answer()
+
+        elif data == "menu:list":
+            channels = core.db.monitor_list_channels()
+            if not channels:
+                await event.edit("Каналов пока нет.", buttons=[[Button.inline("➕ Добавить канал", b"menu:add")]])
+            else:
+                await event.edit("📺 **Каналы:**", buttons=channel_list_buttons(channels))
+
+        elif data == "menu:checkall":
+            await event.answer("Запускаю проверку...")
+            await event.respond("🔍 Проверяю все каналы...")
+            await run_all_channels(client)
+            await event.respond("✅ Готово.", buttons=main_menu_buttons())
+
+        elif data.startswith("ch:info:"):
+            key = data.split(":", 2)[2]
+            ch = core.db.monitor_get_channel(key)
+            if not ch:
+                await event.answer("Канал не найден", alert=True)
+                return
+            target_display = ch.get("target_channel") or f"{TARGET_CHANNEL} (по умолчанию)"
+            await event.respond(
+                f"📺 **{ch['name']}**\nkey: `{ch['key']}`\nХештег: {ch['hashtag']}\nURL: {ch['url']}\n"
+                f"Публикует в: {target_display}\n"
+                f"Бутстрап пройден: {'да' if ch['bootstrapped'] else 'нет'}",
+                buttons=[
+                    [Button.inline("✏️ Сменить хештег", f"ch:tag:{key}".encode())],
+                    [Button.inline("📤 Сменить канал публикации", f"ch:target:{key}".encode())],
+                    [Button.inline("🗑 Удалить канал", f"ch:del:{key}".encode())],
+                    [Button.inline("🔙 К списку", b"menu:list")],
+                ]
+            )
+            await event.answer()
+
+        elif data.startswith("ch:tag:"):
+            key = data.split(":", 2)[2]
+            pending[event.sender_id] = {"action": "edit_hashtag", "step": "wait", "data": {"key": key}}
+            await event.respond(f"Пришли новый хештег для `{key}` (например `#Дюшес`):")
+            await event.answer()
+
+        elif data.startswith("ch:target:"):
+            key = data.split(":", 2)[2]
+            pending[event.sender_id] = {"action": "edit_target", "step": "wait", "data": {"key": key}}
+            await event.respond(
+                f"Пришли @username или -100id Telegram-канала для `{key}`, "
+                f"или `-` для канала по умолчанию (`{TARGET_CHANNEL}`):"
+            )
+            await event.answer()
+
+        elif data.startswith("ch:del:"):
+            key = data.split(":", 2)[2]
+            ch = core.db.monitor_get_channel(key)
+            name = ch["name"] if ch else key
+            await event.edit(
+                f"Точно удалить канал **{name}**? Он перестанет отслеживаться.",
+                buttons=[[
+                    Button.inline("✅ Да, удалить", f"ch:delyes:{key}".encode()),
+                    Button.inline("❌ Отмена", b"menu:list"),
+                ]]
+            )
+
+        elif data.startswith("ch:delyes:"):
+            key = data.split(":", 2)[2]
+            core.db.monitor_remove_channel(key)
+            await event.answer("Удалено")
+            channels = core.db.monitor_list_channels()
+            if channels:
+                await event.edit("📺 **Каналы:**", buttons=channel_list_buttons(channels))
+            else:
+                await event.edit("Каналов больше нет.", buttons=[[Button.inline("➕ Добавить канал", b"menu:add")]])
+
+# ─────────────────────────────────────────────
+# СТАРТ
+# ─────────────────────────────────────────────
+async def main():
+    global user_client
+
+    _init_failure_table()
+
+    client = TelegramClient(
+        "monitor_session",
+        core.API_ID,
+        core.API_HASH,
+        proxy=core.get_telethon_proxy(),
+    )
+    await client.start(bot_token=MONITOR_BOT_TOKEN)
+
+    if MONITOR_USE_USERBOT:
+        try:
+            user_client = TelegramClient(
+                MONITOR_USER_SESSION,
+                core.API_ID,
+                core.API_HASH,
+                proxy=core.get_telethon_proxy(),
+            )
+            # Если сессии ещё нет — Telethon запросит номер телефона и код
+            # прямо в консоли при первом запуске (это нормально, один раз).
+            await user_client.start()
+            me_u = await user_client.get_me()
+            core.term_log(
+                "💎 MONITOR",
+                f"Юзербот для файлов >{BOT_API_FILE_LIMIT_MB}МБ подключен: {me_u.first_name} "
+                f"(убедись, что этот аккаунт добавлен в целевые каналы!)",
+                core.Colors.GREEN
+            )
+        except Exception as e:
+            core.term_log("⚠️ MONITOR", f"Не удалось подключить юзербота для больших файлов: {e}", core.Colors.YELLOW)
+            user_client = None
+
+    migrate_legacy_channels_json()
+
+    core.term_log("🔄 MONITOR", "Сканирую целевые каналы на уже выложенные видео...", core.Colors.CYAN)
+    synced = await sync_all_target_channels()
+    if synced:
+        core.term_log("🔄 MONITOR", f"Итого учтено {synced} уже выложенных видео (не будут дублироваться)", core.Colors.GREEN)
+
+    me = await client.get_me()
+    n = len(core.db.monitor_list_channels())
+    core.term_log("🟢 MONITOR READY", f"@{me.username} следит за {n} каналами, публикует в {TARGET_CHANNEL}", core.Colors.GREEN)
+    core.term_log("💬 MONITOR", "Напиши боту /menu в личку для управления", core.Colors.CYAN)
+
+    register_handlers(client)
+    asyncio.create_task(poll_loop(client))
+    await client.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        core.term_log("🛑 MONITOR", "Остановлен пользователем.", core.Colors.YELLOW)

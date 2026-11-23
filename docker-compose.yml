@@ -9,11 +9,7 @@ services:
     env_file:
       - .env
     environment:
-      # Keep temporary media together with the other persistent bot state.
-      DOWNLOAD_DIR: /app/downloads
-    working_dir: /app
+      BOT_DATA_ENV_OVERRIDE: "true"
     volumes:
-      # Database, Telegram sessions, bot.log, and downloaded media.
+      # Данные бота и настройки, сохранённые через /admin.
       - ./data:/app/data
-      # Lets the interactive menu persist configuration changes on the host.
-      - ./.env:/app/data/.env

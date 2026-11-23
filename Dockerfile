@@ -20,9 +20,7 @@ ENV PATH="/usr/local/bin:${PATH}"
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py ./
+COPY bot.py channel_monitor.py channels.example.json ./
 
-# The process is deliberately run as root: the bot may update the mounted
-# .env file from its built-in terminal menu, and bind-mounted files often have
-# a host-specific owner.
+WORKDIR /app/data
 CMD ["python", "-u", "/app/bot.py"]

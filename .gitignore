@@ -250,7 +250,8 @@ $RECYCLE.BIN/
 __MACOSX/
 .AppleDouble
 .LSOverride
-Icon[]
+Icon[
+]
 
 # Resource forks
 ._*
@@ -271,7 +272,8 @@ Icon[]
 .file
 .disk_label*
 lost+found
-.HFS+ Private Directory Data[]
+.HFS+ Private Directory Data[
+]
 
 # Directories potentially created on remote AFP share
 .AppleDB
@@ -318,3 +320,41 @@ tmbootpicker.efi
 
 # Log files created by default by the nohup command
 nohup.out
+
+# Файлы бота и монитора
+.evn
+.env.txt
+.env.bak
+.env.old
+.env.*.local
+*.session
+*.session-journal
+*cookies*.txt
+cookies.txt
+*.cookies
+channels.json
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+channels.json.imported
+*.log.*
+*.mp4
+*.mkv
+*.webm
+*.mp3
+*.part
+*.ytdl
+*.pyc
+*.pyo
+.venv/
+.vscode/
+.idea/
+*.swp
+*.swo
+desktop.ini
+.DS_Store No newline at end of file
+__pycache__
+/data/
+.env.tmp.*
+*cookies*.txt.tmp
