@@ -637,6 +637,53 @@ def progress_bar(pct: float, length=12) -> str:
     filled = int(length * pct / 100)
     return f"{'█' * filled}{'░' * (length - filled)}"
 
+def transfer_status(heading, current, total, speed, eta):
+    lines = [heading]
+    if total:
+        pct = min(100, current / total * 100)
+        lines.append(f"📊 {progress_bar(pct)} **{pct:.1f}%**")
+        lines.append(f"📦 {fmt_size(current)} / {fmt_size(total)}")
+    else:
+        lines.append(f"📦 {fmt_size(current)}")
+    if speed:
+        lines.append(f"⚡ {fmt_size(speed)}/с")
+    if eta is not None and eta >= 0:
+        lines.append(f"⏳ Осталось: {timedelta(seconds=int(eta))}")
+    return "\n".join(lines)
+
+
+async def edit_transfer_status(msg, text, buttons):
+    try:
+        await msg.edit(text, buttons=buttons)
+    except Exception:
+        pass
+
+
+async def download_with_status(download, *args, msg, buttons, token):
+    progress = None
+
+    def on_progress(current, total, speed, eta):
+        nonlocal progress
+        progress = (current, total, speed, eta)
+
+    await edit_transfer_status(msg, "📥 **Начинаю скачивание с YouTube...**", buttons)
+    task = asyncio.create_task(asyncio.to_thread(download, *args, token, progress_cb=on_progress))
+    last_progress = None
+    while not task.done():
+        await asyncio.wait({task}, timeout=3.5)
+        current = progress
+        if task.done() or token.cancelled or current is None or current == last_progress:
+            continue
+        last_progress = current
+        heading = "📥 **Скачивание с YouTube** (текущий поток)"
+        await edit_transfer_status(msg, transfer_status(heading, *current), buttons)
+
+    result = task.result()
+    if not token.cancelled:
+        await edit_transfer_status(msg, "⚙️ **Подготовка файла...**", buttons)
+    return result
+
+
 def extract_url(text: str) -> Optional[str]:
     m = re.search(
         r'(https?://(?:www\.)?youtu(?:be\.com/watch\?v=|\.be/|be\.com/shorts/|be\.com/playlist\?list=)[^\s]+)',
@@ -1250,7 +1297,7 @@ def ytdlp_opts() -> dict:
     opts.update(get_cookie_opts())
     return opts
 
-def make_progress_hook(video_id: str, cancel_token=None):
+def make_progress_hook(video_id: str, cancel_token=None, progress_cb=None):
     """Хук для yt-dlp: пишет скорость/%/ETA в терминал (раз в ~3 сек, чтобы не
     спамить), плюс проверяет отмену. noprogress=True в opts глушит ТОЛЬКО
     встроенный вывод yt-dlp (и мигание при чтении cookies из браузера) —
@@ -1271,6 +1318,8 @@ def make_progress_hook(video_id: str, cancel_token=None):
                 speed = d.get("speed") or 0
                 pct = (downloaded / total * 100) if total else 0
                 eta = d.get("eta")
+                if progress_cb:
+                    progress_cb(downloaded, total, speed, eta)
                 speed_mb = (speed / 1024 / 1024) if speed else 0
                 term_log(
                     "📥 DOWNLOAD",
@@ -1285,10 +1334,10 @@ def make_progress_hook(video_id: str, cancel_token=None):
 
     return hook
 
-def download_video(url: str, quality: str, user_id: int, video_id: str, lang: str = "orig", cancel_token=None) -> str:
+def download_video(url: str, quality: str, user_id: int, video_id: str, lang: str = "orig", cancel_token=None, *, progress_cb=None) -> str:
     opts = ytdlp_opts()
     opts["noplaylist"] = True
-    opts["progress_hooks"] = [make_progress_hook(video_id, cancel_token)]
+    opts["progress_hooks"] = [make_progress_hook(video_id, cancel_token, progress_cb)]
 
     file_suffix = f"_{lang}" if lang in ("ru", "en", "ya") else ""
     opts["outtmpl"] = os.path.join(DOWNLOAD_DIR, f"{user_id}_{video_id}{file_suffix}.%(ext)s")
@@ -1384,10 +1433,10 @@ def download_video(url: str, quality: str, user_id: int, video_id: str, lang: st
 
     return path
 
-def download_mp3(url: str, user_id: int, video_id: str, lang: str = "orig", cancel_token=None) -> str:
+def download_mp3(url: str, user_id: int, video_id: str, lang: str = "orig", cancel_token=None, *, progress_cb=None) -> str:
     opts = ytdlp_opts()
     opts["noplaylist"] = True
-    opts["progress_hooks"] = [make_progress_hook(video_id, cancel_token)]
+    opts["progress_hooks"] = [make_progress_hook(video_id, cancel_token, progress_cb)]
 
     file_suffix = f"_{lang}" if lang in ("ru", "en") else ""
     opts["outtmpl"] = os.path.join(DOWNLOAD_DIR, f"{user_id}_{video_id}{file_suffix}.%(ext)s")
@@ -1477,13 +1526,30 @@ async def upload_file(client: TelegramClient, path: str, progress_cb=None, cance
                         raise
                     await asyncio.sleep(1)
             async with lock:
-                uploaded += 1
+                uploaded += len(data)
                 if progress_cb:
-                    await progress_cb(min(uploaded * chunk, size), size)
+                    await progress_cb(uploaded, size)
 
     with open(path, "rb") as f:
         await asyncio.gather(*[worker(f) for _ in range(6)])
     return types.InputFileBig(id=file_id, parts=parts, name=os.path.basename(path))
+
+async def upload_with_status(sender, path, msg, buttons, token, heading):
+    await edit_transfer_status(msg, heading, buttons)
+    started = last_edit = time.monotonic()
+
+    async def on_progress(current, total):
+        nonlocal last_edit
+        now = time.monotonic()
+        if token.cancelled or now - last_edit < 3.5:
+            return
+        last_edit = now
+        speed = current / (now - started)
+        eta = (total - current) / speed if speed else None
+        await edit_transfer_status(msg, transfer_status(heading, current, total, speed, eta), buttons)
+
+    return await upload_file(sender, path, on_progress, token)
+
 
 # ─────────────────────────────────────────────
 # КЛАВИАТУРЫ (REPLY И INLINE)
@@ -2619,10 +2685,14 @@ def setup_handlers(client: TelegramClient):
             download_lang = "orig" if lang == "ya" else lang
 
             if quality == "mp3":
-                final = await asyncio.to_thread(download_mp3, meta["url"], uid, vid, download_lang, token)
+                final = await download_with_status(
+                    download_mp3, meta["url"], uid, vid, download_lang, msg=msg, buttons=cancel_kb, token=token,
+                )
                 thumb = None
             else:
-                raw_src = await asyncio.to_thread(download_video, meta["url"], quality, uid, vid, download_lang, token)
+                raw_src = await download_with_status(
+                    download_video, meta["url"], quality, uid, vid, download_lang, msg=msg, buttons=cancel_kb, token=token,
+                )
                 thumb_key = f"{vid}_{download_lang}" if download_lang in ("ru", "en") else str(vid)
                 thumb = make_thumb(uid, thumb_key)
                 final = os.path.join(DOWNLOAD_DIR, f"{uid}_{vid}_{lang}_fast.mp4")
@@ -2663,39 +2733,9 @@ def setup_handlers(client: TelegramClient):
 
                 contour = "💎 Premium 4GB" if (size_mb > 1950 and user_client) else "📦 Standard 2GB"
                 term_log("🚀 UPLOAD", f"[{uid}] Загрузка в Telegram [{contour}] ({size_mb:.1f} МБ)...", Colors.CYAN)
-                await msg.edit(f"⚙️ **Файл готов!**\n📤 Загрузка в Telegram [{contour}]...", buttons=cancel_kb)
-
-                t0 = time.time()
-                last_edit = [time.time()]
-                last_text = [""]
-
-                async def on_progress(cur, total):
-                    if token.cancelled:
-                        raise ValueError("CANCELLED")
-                    now = time.time()
-                    if now - last_edit[0] < 3.5:
-                        return
-                    pct = cur / total * 100
-                    speed = cur / max(now - t0, 0.1)
-                    eta = (total - cur) / speed if speed > 0 else 0
-                    text = (
-                        f"🚀 **Выгрузка в Telegram** [{contour}]\n"
-                        f"🔊 Звук: **{lang_label}**\n\n"
-                        f"📊 {progress_bar(pct)} **{pct:.1f}%**\n"
-                        f"⚡ Скорость: **{speed / 1024 / 1024:.1f} МБ/с**\n"
-                        f"⏳ Осталось: **{timedelta(seconds=int(eta))}**"
-                    )
-                    if text == last_text[0]:
-                        return
-                    last_text[0] = text
-                    last_edit[0] = now
-                    try:
-                        await msg.edit(text, buttons=cancel_kb)
-                    except Exception:
-                        pass
-
                 sender = user_client if (size_mb > 1950 and is_premium and user_client) else client
-                uploaded = await upload_file(sender, final, on_progress if sender == client else None, token)
+                heading = f"📤 **Загрузка в Telegram** [{contour}]\n🔊 Звук: **{lang_label}**"
+                uploaded = await upload_with_status(sender, final, msg, cancel_kb, token, heading)
 
                 if token.cancelled:
                     raise ValueError("CANCELLED")
@@ -2861,11 +2901,15 @@ def setup_handlers(client: TelegramClient):
 
         try:
             if quality == "mp3":
-                final = await asyncio.to_thread(download_mp3, url, uid, vid, lang, token)
+                final = await download_with_status(
+                    download_mp3, url, uid, vid, lang, msg=status, buttons=cancel_kb, token=token,
+                )
                 thumb = None
                 attrs = [DocumentAttributeAudio(duration=duration, title=audio_title, performer=uploader)]
             else:
-                raw_src = await asyncio.to_thread(download_video, url, quality, uid, vid, lang, token)
+                raw_src = await download_with_status(
+                    download_video, url, quality, uid, vid, lang, msg=status, buttons=cancel_kb, token=token,
+                )
                 thumb_key = f"{vid}_{lang}" if lang in ("ru", "en") else str(vid)
                 thumb = make_thumb(uid, thumb_key)
                 final = os.path.join(DOWNLOAD_DIR, f"{uid}_{vid}_{lang}_fast.mp4")
@@ -2892,7 +2936,9 @@ def setup_handlers(client: TelegramClient):
                     return
 
                 sender = user_client if (size_mb > 1950 and is_premium and user_client) else client
-                uploaded = await upload_file(sender, final, cancel_token=token)
+                uploaded = await upload_with_status(
+                    sender, final, status, cancel_kb, token, "📤 **Загрузка в Telegram**",
+                )
                 if token.cancelled:
                     raise ValueError("CANCELLED")
 
