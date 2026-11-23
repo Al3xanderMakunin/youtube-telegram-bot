@@ -1199,14 +1199,6 @@ def ytdlp_opts() -> dict:
         "fragment_retries": 10,
         "concurrent_fragment_downloads": 4,
         "sleep_interval_requests": 1,
-
-        # Ключевое: клиенты, отдающие DASH 1080p/720p
-        # tv — YouTube TV app, отдаёт полный DASH без PO Token
-        # mweb — мобильный web, отдаёт DASH
-        # web — запасной
-        "extractor_args": {
-            "youtube": {"player_client": ["tv", "mweb", "web"]}
-        },
     }
 
     if deno_path := shutil.which("deno"):
@@ -1274,9 +1266,6 @@ def download_video(url: str, quality: str, user_id: int, video_id: str, lang: st
 
     if lang == "ru":
         opts["format_sort"] = ["hasaud", "lang:ru", f"res:{q}", "codec:h264:vp9:av1", "fps", "size", "br"]
-        opts["extractor_args"] = {
-            "youtube": ["player_client=web,mweb", "lang=ru"]
-        }
         audio_priority = [
             "bestaudio[language^=ru]", "bestaudio[language*=ru]",
             "bestaudio[format_note*=Russian]", "bestaudio[format_note*=русск]",
@@ -1294,9 +1283,6 @@ def download_video(url: str, quality: str, user_id: int, video_id: str, lang: st
 
     elif lang == "en":
         opts["format_sort"] = ["hasaud", "lang:en", f"res:{q}", "codec:h264:vp9:av1", "fps", "size", "br"]
-        opts["extractor_args"] = {
-            "youtube": ["player_client=web,mweb", "lang=en"]
-        }
         audio_priority = [
             "bestaudio[language^=en]", "bestaudio[language*=en]",
             "bestaudio[format_note*=English]", "bestaudio"
